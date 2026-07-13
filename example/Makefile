@@ -18,5 +18,6 @@ TopSim.v: king.lop
 
 clean:
 	rm -fr obj_dir/
-	rm -fr tb-cond.h tb-sig.h tb-top.h
+	rm -fr tb-sig.h tb-top.h tb.py
 	rm -f TopSim.v
+	rm -f simx.vcd

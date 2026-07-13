@@ -1,9 +1,9 @@
+import os
 import subprocess
 import sys
-import os
 import threading
-import select
-import time
+
+from collections import namedtuple
 
 class Channel:
 	def __init__(self, name):
@@ -14,9 +14,6 @@ class Channel:
 		self._name = name
 		self._w = w
 		self._r = r
-		self._poll = select.poll()
-
-		self._poll.register(self._r, select.POLLIN)
 
 	def get_rfd(self):
 		return self._r
@@ -30,16 +27,6 @@ class Channel:
 	def write(self, value):
 		os.write(self._w, f'{value}\n'.encode())
 
-		# Wait until read happens
-		while True:
-			events = self._poll.poll(0)
-			if not events:
-				break
-			if events[0][1] & select.POLLNVAL:
-				break
-			# Schedule to another thread
-			time.sleep(0)
-
 class Signal:
 	def __init__(self, name, chan):
 		self.name = name
@@ -48,42 +35,69 @@ class Signal:
 	def set(self, value):
 		self.chan.write(f'{self.name} {value}')
 
-	def wait(self, value):
+	def addwait(self, value):
 		self.chan.write(f'? {self.name} {value}')
 
-	def mustbe(self, value):
-		self.chan.write(f'! {self.name} {value}')
+class Router:
+	def __init__(self, **kwargs):
+		for k, v in kwargs.items():
+			if type(v) == dict:
+				v = Router(**v)
+			setattr(self, k, v)
 
-class Port:
-	def __init__(self, chan, siglist):
-		self._sig = {}
+		self._inited = True
 
-		for i in siglist:
-			self._sig[i] = Signal(i, chan)
-
-	def __getattr__(self, name):
-		if '_sig' in self.__getattribute__('__dict__'):
-			return self._sig[name]
-		raise Exception(name)
-
-	def __setattr__(self, name, value):
-		if '_sig' in self.__getattribute__('__dict__'):
-			self._sig[name].set(value)
-			return
-		object.__setattr__(self, name, value)
+	def __setattr__(self, key, value):
+		if '_inited' in self.__dict__:
+			raise Exception('Nothing can be assigned!')
+		super().__setattr__(key, value)
 
 class DUT:
 	def __init__(self, chan, siglist, task):
 		self._chan = chan
-		self._task = task
-		self.port = Port(chan, siglist)
+		if task:
+			self._ev = None
+			self._task = task
+		else:
+			self._ev = EventLoop()
+			self._task = lambda dut: dut._ev.loop()
 		self.thread = None
 
-	def wait(self, value):
-		self._chan.write(value)
+		def add(sigs, sig):
+			part = sig.split('.')
+			for i in range(len(part) - 1):
+				if part[i] not in sigs:
+					sigs[part[i]] = {}
+				sigs = sigs[part[i]]
+			sigs[part[-1]] = Signal(sig, chan)
 
-	def semaphore(self):
-		self._chan.write('semaphore')
+		sigs = {}
+		for i in siglist:
+			add(sigs, i)
+
+		self.port = Router(**sigs)
+
+	@property
+	def ev(self):
+		return self._ev
+
+	def wait(self, value=-1):
+		if value < 0:
+			self._chan.write('wait')
+		else:
+			self._chan.write(value)
+
+	def semaphore(self, value=0, name=''):
+		self._chan.write(f'@ {value} {name}')
+
+	def cond_remove(self, cond):
+		self._chan.write(f'- {cond}')
+
+	def cond_wait(self, cond):
+		self._chan.write(f'= {cond}')
+
+	def cond_notify(self, cond):
+		self._chan.write(f'+ {cond}')
 
 	def finish(self):
 		self._chan.write('exit')
@@ -92,10 +106,10 @@ class DUT:
 		self._chan.write('done')
 
 	def dump(self, enable):
-		cmd = 'dumpoff'
+		cmd = 'off'
 		if enable:
-			cmd = 'dumpon'
-		self._chan.write(cmd)
+			cmd = 'on'
+		self._chan.write(f'dump {cmd}')
 
 	def get_rfd(self):
 		return self._chan.get_rfd()
@@ -118,16 +132,22 @@ class VeriTest:
 		self._siglist = siglist
 		self._tasks = []
 		self._vcd = vcd
+		self._pid = -1
+		self._sema = 0
 
-	def add(self, task):
+	def add(self, task=None):
 		ret = DUT(Channel(str(task)), self._siglist, task)
 		self._tasks.append(ret)
 		return ret
 
 	def run(self):
-		pid = os.fork()
+		self.start()
+		self.finish()
 
-		if pid == 0:
+	def start(self):
+		self._pid = os.fork()
+
+		if self._pid == 0:
 			# If not closed, then child process will not receive
 			# HUP fd state on its side.
 			for i in self._tasks:
@@ -138,17 +158,72 @@ class VeriTest:
 			sys.exit()
 
 		for i in self._tasks:
+			i.close_rfd()
+
+		for i in self._tasks:
 			i.thread = threading.Thread(target=i.get_task(), args=(i,))
 			i.thread.start()
 
+	def finish(self):
 		# First, we wait for the child to end.
-		os.waitpid(pid, 0)
+		os.waitpid(self._pid, 0)
 
 		# And then, we close our threads.
 		for i in self._tasks:
-			i.close_rfd()
 			i.close_wfd()
 			i.thread.join()
+
+	def semaphore(self, *args):
+		if not args:
+			args = self._tasks
+		for i in args:
+			i.semaphore(len(args), str(self._sema))
+		self._sema += 1
+
+	def wait(self, value):
+		for i in self._tasks:
+			i.wait(value)
+
+class EventLoop:
+	def __init__(self):
+		self._cv = threading.Condition()
+		self._cv_done = threading.Condition()
+		self._cmd = []
+
+	def _done(self):
+		with self._cv_done:
+			self._cmd = []
+			self._cv_done.notify()
+
+	def loop(self):
+		stop = False
+
+		with self._cv:
+			while not stop:
+				self._cv.wait_for(lambda: len(self._cmd) > 0)
+
+				for cmd in self._cmd:
+					if not cmd:
+						stop = True
+						break
+					cmd()
+				else:
+					self._done()
+
+		self._done()
+
+	def run(self, *args):
+		with self._cv:
+			self._cmd.extend(args)
+			self._cv.notify()
+
+	def stop(self):
+		self.run(None)
+		self.wait()
+
+	def wait(self):
+		with self._cv_done:
+			self._cv_done.wait_for(lambda: len(self._cmd) == 0)
 
 class UART:
 	def __init__(self, dut, sig, div):

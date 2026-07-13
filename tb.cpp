@@ -6,9 +6,14 @@
 #include <poll.h>
 #include <iostream>
 #include <fstream>
+#include <map>
 
+struct State;
 static bool dumpon;
-static int semaphore;
+static std::map<std::string, int> semaphore;
+static std::map<std::string, int> cond;
+static int done;
+static std::vector<State *> st;
 
 static bool is_number(const std::string& s)
 {
@@ -29,14 +34,19 @@ struct State {
 		READ,
 		WAIT,
 		WAIT_COND,
-		WAIT_COND_WIRE,
 		VALUE_ASSERT,
+		SEMAPHORE,
 		DONE,
 		FATAL,
+		EVAL,
+		WAIT_COND_NOTIFY,
 	} m_state;
 	unsigned long m_cnt;
-	std::string m_name;
-	unsigned long m_val;
+	std::map<std::string, int> m_wq;
+	std::string m_signal;
+	std::string m_value;
+	std::string m_semaphore;
+	std::string m_cond;
 
 	State(std::string file, TOP *top) :
 		m_file(file),
@@ -55,74 +65,34 @@ struct State {
 
 	bool set(std::string name, std::string value)
 	{
-#define SIG(signal, var) else if (name == #signal) { m_top->var = strtoul(value.data(), NULL, 0); }
+#define SIG(signal, var) else if (name == #signal) { m_top->var = strtoul(value.data(), NULL, 0); return true; }
 		if (0) {}
 #include "tb-sig.h"
-		else {
-			fprintf(stderr, "SIGNAL '%s' NOT FOUND IN %s:%li\n", name.data(), m_file.data(), m_line);
-			return false;
-		}
 #undef SIG
 
-		return true;
-	}
-
-	bool check()
-	{
-#define COND(signal, var) else if (m_name == #signal) { return m_top->var == m_val; }
-		if (0) {}
-#include "tb-cond.h"
-		else {
-			fprintf(stderr, "SIGNAL '%s' NOT FOUND IN %s:%li\n", m_name.data(), m_file.data(), m_line);
-			m_state = FATAL;
-			return false;
-		}
-#undef COND
-
+		fprintf(stderr, "SIGNAL '%s' NOT FOUND IN %s:%li\n", name.data(), m_file.data(), m_line);
 		return false;
 	}
 
-	bool value_assert()
+	bool check(std::string name, int val)
 	{
-		if (!check()) {
-			if (m_state == FATAL) {
-				m_top->contextp()->gotFinish(true);
-				return false;
-			}
-			fprintf(stderr, "ASSERT FAILED AT %s:%li\n", m_file.data(), m_line);
-			m_state = DONE;
-			m_top->contextp()->gotFinish(true);
-			return false;
-		}
+#define SIG(signal, var) else if (name == #signal) { return m_top->var == val; }
+		if (0) {}
+#include "tb-sig.h"
+#undef SIG
 
-		m_state = READ;
-		return true;
+		fprintf(stderr, "SIGNAL '%s' NOT FOUND IN %s:%li\n", name.data(), m_file.data(), m_line);
+		m_top->contextp()->gotFinish(true);
+		m_state = FATAL;
+		return false;
 	}
 
-	bool cond()
-	{
-		switch (m_state) {
-		case WAIT_COND:
-			if (!check()) {
-				if (m_state == FATAL) {
-					m_top->contextp()->gotFinish(true);
-					return false;
-				}
-				return true;
-			}
-
-			m_state = READ;
-			return true;
-		case VALUE_ASSERT:
-			return value_assert();
-		}
-
-		return true;
-	}
-
-	void fatal()
+	void fatal(const char *msg)
 	{
 		fprintf(stderr, "FILE ERROR IN %s\n", m_file.data());
+		if (msg) {
+			fprintf(stderr, "Error: %s\n", msg);
+		}
 		m_top->contextp()->gotFinish(true);
 	}
 
@@ -131,143 +101,181 @@ struct State {
 		m_state = READ;
 	}
 
-	bool step()
+	void step_wait()
 	{
-		switch (m_state) {
-		case WAIT:
-			m_cnt--;
-			if (m_cnt == 0) {
-				m_state = READ;
-				break;
-			}
-			return true;
-		case WAIT_COND:
-			return true;
-		case VALUE_ASSERT:
-			return true;
-		case WAIT_COND_WIRE:
-			if (!check()) {
-				if (m_state == FATAL) {
-					m_top->contextp()->gotFinish(true);
-					return false;
-				}
-				return true;
-			}
+		if (m_state != WAIT) {
+			return;
+		}
 
+		m_cnt--;
+		if (m_cnt == 0) {
 			m_state = READ;
-			break;
-		case DONE:
-			return true;
-		case READ:
-			break;
-		default:
-			fprintf(stderr, "FATAL STATE\n");
-			m_top->contextp()->gotFinish(true);
-			return false;
+		}
+	}
+
+	void step_cond_notify()
+	{
+		if (m_state != WAIT_COND_NOTIFY) {
+			return;
+		}
+
+		auto it = cond.find(m_cond);
+
+		if (it == cond.end()) {
+			return;
+		}
+
+		m_state = READ;
+	}
+
+	void step_cond()
+	{
+		if (m_state != WAIT_COND) {
+			return;
+		}
+
+		for (auto it = m_wq.begin(); it != m_wq.end(); it++) {
+			if (!check(it->first, it->second)) {
+				return;
+			}
+		}
+
+		m_wq.clear();
+		m_state = READ;
+	}
+
+	void full_read()
+	{
+		while (m_state == READ) {
+			read();
+		}
+	}
+
+	std::string next_token(std::string& str)
+	{
+		auto pos = str.find(' ');
+		auto ret = str.substr(0, pos);
+
+		if (pos == std::string::npos) {
+			str.erase();
+		} else {
+			str.erase(0, pos + 1);
+		}
+		return ret;
+	}
+
+	void read()
+	{
+		if (m_state != READ) {
+			return;
 		}
 
 		std::string cmd;
 
-		do {
-			cmd.resize(1024);
+		cmd.resize(1024);
 
-			if (poll(&m_pfd, 1, -1) < 0) {
-				fatal();
-				return false;
+		if (poll(&m_pfd, 1, -1) < 0) {
+			fatal("poll");
+			return;
+		}
+
+		if (m_pfd.revents & POLLHUP) {
+			fatal("hup");
+			return;
+		}
+
+		if (!fgets(cmd.data(), cmd.capacity(), m_in)) {
+			if (!feof(m_in)) {
+				fatal("eof");
+				return;
 			}
+			m_state = DONE;
+			return;
+		}
 
-			if (m_pfd.revents & POLLHUP) {
-				fatal();
-				return false;
-			}
+		cmd.resize(strlen(cmd.data()) - 1);
 
-			if (!fgets(cmd.data(), cmd.capacity(), m_in)) {
-				if (!feof(m_in)) {
-					fatal();
-					return false;
-				}
-				m_state = DONE;
-				return true;
-			}
+		m_line++;
 
-			cmd.resize(strlen(cmd.data()) - 1);
+		std::string token = next_token(cmd);
 
-			m_line++;
+		if (token.size() == 0 || token == "#") {
+			return;
+		}
 
-			if (cmd[0] == '#' || cmd.size() == 0) {
-				continue;
-			}
-
-			if (is_number(cmd)) {
-				m_cnt = strtoul(cmd.data(), NULL, 0);
-				if (m_cnt == 0) {
-					return true;
-				}
+		if (is_number(token)) {
+			m_cnt = strtoul(token.data(), NULL, 0);
+			if (m_cnt > 0) {
 				m_state = WAIT;
-				return true;
-			} else if (cmd[0] == '!') {
-				cmd = cmd.substr(cmd.find(' ') + 1);
-				m_name = cmd.substr(0, cmd.find(' '));
-				cmd.erase(0, cmd.find(' ') + 1);
-				m_val = strtoul(cmd.data(), NULL, 0);
-
-				if (!value_assert()) {
-					return false;
-				}
-				break;
-			} else if (cmd[0] == '?') {
-				if (cmd[1] == '>') {
-					m_state = WAIT_COND_WIRE;
-				} else {
-					m_state = WAIT_COND;
-				}
-
-				cmd = cmd.substr(cmd.find(' ') + 1);
-				m_name = cmd.substr(0, cmd.find(' '));
-				cmd.erase(0, cmd.find(' ') + 1);
-				m_val = strtoul(cmd.data(), NULL, 0);
-
-				if (m_state == WAIT_COND_WIRE) {
-					if (!check()) {
-						if (m_state == FATAL) {
-							m_top->contextp()->gotFinish(true);
-							return false;
-						}
-					} else {
-						m_state = READ;
-						break;
-					}
-				}
-				return true;
-			} else if (cmd == "exit") {
-				fprintf(stderr, "EXIT IN %s:%li\n", m_file.data(), m_line);
-				m_top->contextp()->gotFinish(true);
-				return false;
-			} else if (cmd == "done") {
-				fprintf(stderr, "DONE %s:%li\n", m_file.data(), m_line);
-				m_state = DONE;
-				fclose(m_in);
-				return false;
-			} else if (cmd == "semaphore") {
-				semaphore++;
-				m_state = DONE;
-				return false;
-			} else if (cmd == "dumpon") {
-				dumpon = true;
-			} else if (cmd == "dumpoff") {
-				dumpon = false;
-			} else {
-				std::string name = cmd.substr(0, cmd.find(' '));
-				cmd.erase(0, cmd.find(' ') + 1);
-
-				if (!set(name, cmd)) {
-					m_top->contextp()->gotFinish(true);
-					return false;
-				}
 			}
-		} while (false);
+		} else if (token == "?") {
+			std::string name = next_token(cmd);
+			int val = strtoul(next_token(cmd).data(), NULL, 0);
 
-		return true;
+			m_wq[name] = val;
+		} else if (token == "wait") {
+			m_state = WAIT_COND;
+		} else if (token == "exit") {
+			fprintf(stderr, "EXIT IN %s:%li\n", m_file.data(), m_line);
+			m_top->contextp()->gotFinish(true);
+		} else if (token == "done") {
+			fprintf(stderr, "DONE %s:%li\n", m_file.data(), m_line);
+			m_state = DONE;
+			fclose(m_in);
+			done++;
+
+			if (done == st.size()) {
+				m_top->contextp()->gotFinish(true);
+			}
+		} else if (token == "@") {
+			std::string svalue = next_token(cmd);
+			std::string name = next_token(cmd);
+
+			int val = strtol(svalue.data(), NULL, 0);
+
+			if (semaphore.find(name) == semaphore.end()) {
+				if (val == 0) {
+					val = st.size();
+				}
+				semaphore[name] = val;
+			}
+
+			semaphore[name]--;
+			m_semaphore = name;
+			m_state = SEMAPHORE;
+		} else if (token == "-") {
+			std::string name = next_token(cmd);
+
+			cond.erase(name);
+		} else if (token == "+") {
+			std::string name = next_token(cmd);
+
+			cond[name] = 1;
+		} else if (token == "=") {
+			std::string name = next_token(cmd);
+
+			m_cond = name;
+			m_state = WAIT_COND_NOTIFY;
+		} else if (token == "dump") {
+			dumpon = next_token(cmd) == "on";
+		} else {
+			m_signal = token;
+			m_value = next_token(cmd);
+			m_state = EVAL;
+		}
+	}
+
+	void eval()
+	{
+		if (m_state != EVAL) {
+			return;
+		}
+
+		if (!set(m_signal, m_value)) {
+			m_top->contextp()->gotFinish(true);
+		}
+
+		m_state = READ;
 	}
 };
 
@@ -285,25 +293,55 @@ int main(int argc, char** argv, char** env)
 	top->trace(tfp, 99);
 	tfp->open(argv[1]);
 
-	std::vector<State *> st;
 	for (int i = 2; i < argc; i++) {
 		st.push_back(new State(argv[i], top));
 	}
 
 	while (!contextp->gotFinish()) {
-		for (auto* s : st) {
-			s->step();
-		}
+		while (1) {
+			bool need_eval = false;
+			bool need_read = false;
 
-		if (semaphore == st.size()) {
 			for (auto* s : st) {
-				s->start();
+				s->full_read();
 			}
-			semaphore = 0;
-		}
 
-		/* Evaluate combs */
-		top->eval();
+			for (auto* s : st) {
+				need_eval |= s->m_state == State::EVAL;
+				s->eval();
+				need_read |= s->m_state == State::READ;
+			}
+
+			/* Evaluate combs */
+			if (need_eval) {
+				top->eval();
+			}
+
+			for (auto* s : st) {
+				s->step_cond();
+				s->step_cond_notify();
+				need_read |= s->m_state == State::READ;
+			}
+
+			for (auto it = semaphore.begin(); it != semaphore.end(); ) {
+				if (it->second == 0) {
+					for (auto* s : st) {
+						if (s->m_state == State::SEMAPHORE && it->first == s->m_semaphore) {
+							s->start();
+						}
+					}
+
+					it = semaphore.erase(it);
+					need_read = true;
+				} else {
+					it++;
+				}
+			}
+
+			if (!need_read) {
+				break;
+			}
+		}
 
 		if (dumpon) {
 			tfp->dump(contextp->time());
@@ -313,13 +351,11 @@ int main(int argc, char** argv, char** env)
 		/* Evaluate seqs */
 		top->clk ^= 1;
 
-		if (top->clk) {
-			for (auto* s : st) {
-				s->cond();
-			}
-		}
-
 		top->eval();
+
+		for (auto* s : st) {
+			s->step_wait();
+		}
 	}
 
 	tfp->dump(contextp->time());
