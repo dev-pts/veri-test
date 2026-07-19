@@ -58,8 +58,9 @@ class Router:
 		super().__setattr__(key, value)
 
 class DUT:
-	def __init__(self, chan, siglist, task):
+	def __init__(self, chan, siglist, task, param):
 		self._chan = chan
+		self.param = param
 		if task:
 			self._ev = None
 			self._task = task
@@ -160,8 +161,8 @@ class VeriTest:
 		self._pid = -1
 		self._sema = 0
 
-	def add(self, task=None):
-		ret = DUT(Channel(str(task)), self._siglist, task)
+	def add(self, task=None, param=None):
+		ret = DUT(Channel(str(task)), self._siglist, task, param)
 		self._tasks.append(ret)
 		return ret
 
