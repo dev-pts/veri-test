@@ -348,10 +348,12 @@ int main(int argc, char** argv, char** env)
 			contextp->timeInc(1);
 		}
 
+#ifdef CLK
 		/* Evaluate seqs */
-		top->clk ^= 1;
+		top->CLK ^= 1;
 
 		top->eval();
+#endif
 
 		for (auto* s : st) {
 			s->step_wait();

@@ -2,6 +2,7 @@
 
 topname=$1
 filename=$2
+clk=$3
 
 all_ports=$(${LOP_HDL} get-all-ports $topname $filename)
 
@@ -11,6 +12,7 @@ done > tb-sig.h
 
 cat > tb-top.h <<EOF
 #define TOP V$topname
+$([ -n "$clk" ] && printf "#define CLK $clk" || printf "// #define CLK ...")
 
 #include "V$topname.h"
 EOF
