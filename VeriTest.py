@@ -43,6 +43,11 @@ class Router:
 		for k, v in kwargs.items():
 			if type(v) == dict:
 				v = Router(**v)
+			elif type(v) == list:
+				ret = []
+				for i in v:
+					ret.append(Router(**i))
+				v = ret
 			setattr(self, k, v)
 
 		self._inited = True
@@ -66,9 +71,29 @@ class DUT:
 		def add(sigs, sig):
 			part = sig.split('.')
 			for i in range(len(part) - 1):
-				if part[i] not in sigs:
-					sigs[part[i]] = {}
-				sigs = sigs[part[i]]
+				name = part[i]
+
+				idx_start = name.find('[')
+				idx_end = name.find(']')
+				is_array = idx_start >= 0
+
+				if is_array:
+					idx = int(name[idx_start + 1:idx_end])
+					name = name[:idx_start]
+
+				if name not in sigs:
+					if is_array:
+						sigs[name] = []
+					else:
+						sigs[name] = {}
+
+				sigs = sigs[name]
+
+				if is_array:
+					while len(sigs) <= idx:
+						sigs.append({})
+					sigs = sigs[idx]
+
 			sigs[part[-1]] = Signal(sig, chan)
 
 		sigs = {}
